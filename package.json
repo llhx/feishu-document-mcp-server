@@ -1,0 +1,42 @@
+{
+  "name": "feishu-document-mcp-server",
+  "version": "1.0.0",
+  "description": "Read-only MCP server for Feishu/Lark documents, Wiki pages, and embedded images",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": "./dist/index.js",
+  "bin": {
+    "feishu-document-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "postbuild": "node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
+    "start": "node dist/index.js",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "feishu",
+    "lark",
+    "document",
+    "model-context-protocol"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.31.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

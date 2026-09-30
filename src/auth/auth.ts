@@ -1,9 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
 import { createServer, type Server } from 'node:http'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { AuthStorage, type PendingAuthorization, type UserTokenBundle } from './auth-storage.js'
+import { API_REQUEST_TIMEOUT_MS } from '../shared/limits.js'
 
 const DEFAULT_SCOPES = [
   'offline_access',
@@ -15,23 +13,7 @@ const DEFAULT_SCOPES = [
   'docs:document.media:download',
 ]
 
-/** Fallback scopes used when the full list fails due to an unenabled scope in the app */
-const FALLBACK_SCOPES = [
-  'offline_access',
-  'docx:document:readonly',
-  'wiki:node:read',
-  'sheets:spreadsheet:readonly',
-  'bitable:app:readonly',
-  'drive:drive:readonly',
-]
-
-interface UserTokenBundle {
-  accessToken: string
-  accessTokenExpiresAt: number
-  refreshToken?: string
-  refreshTokenExpiresAt?: number
-  scope: string
-}
+const CALLBACK_HEALTH_RESPONSE = 'feishu-document-mcp'
 
 interface OAuthTokenResponse {
   code?: number
@@ -49,11 +31,6 @@ interface TenantTokenResponse {
   msg: string
   tenant_access_token?: string
   expire?: number
-}
-
-interface PendingAuthorization {
-  state: string
-  authorizationUrl: string
 }
 
 export interface AuthStatus {
@@ -74,10 +51,9 @@ export class AuthManager {
   private readonly accountsBaseUrl: string
   private readonly redirectUri: string
   private readonly scopes: string[]
-  private readonly keychainService: string
-  private readonly fallbackStorePath: string
-  private readonly pendingAuthPath: string
+  private readonly storage: AuthStorage
   private userTokens?: UserTokenBundle
+  private userTokenRefresh?: Promise<UserTokenBundle>
   private tenantToken?: { value: string; expiresAt: number }
   private oauthServer?: Server
   private pendingAuthorization?: PendingAuthorization
@@ -89,11 +65,9 @@ export class AuthManager {
     this.accountsBaseUrl = process.env.FEISHU_ACCOUNTS_BASE_URL ?? 'https://accounts.feishu.cn'
     this.redirectUri = process.env.FEISHU_OAUTH_REDIRECT_URI ?? 'http://localhost:3000/callback'
     this.scopes = (process.env.FEISHU_READONLY_SCOPES?.split(/[ ,]+/) ?? DEFAULT_SCOPES).filter(Boolean)
-    this.keychainService = `qoder-feishu-document-mcp:${this.appId || 'unconfigured'}`
-    this.fallbackStorePath = join(homedir(), '.config', 'feishu-document-mcp', 'tokens.json')
-    this.pendingAuthPath = join(homedir(), '.config', 'feishu-document-mcp', 'pending-auth.json')
-    this.userTokens = this.loadStoredTokens()
-    this.pendingAuthorization = this.loadPendingAuthorization()
+    this.storage = new AuthStorage(this.appId)
+    this.userTokens = this.storage.loadTokens()
+    this.pendingAuthorization = this.storage.loadPendingAuthorization()
   }
 
   getApiBaseUrl(): string {
@@ -101,24 +75,21 @@ export class AuthManager {
   }
 
   isUserAuthenticated(): boolean {
-    const envUserToken = process.env.FEISHU_USER_ACCESS_TOKEN
-    if (envUserToken) return true
-    const tokens = this.userTokens ?? this.loadStoredTokens()
-    if (!tokens?.accessToken) return false
-    if (tokens.accessTokenExpiresAt > Date.now() + 60_000) return true
-    return Boolean(tokens.refreshToken)
+    if (process.env.FEISHU_USER_ACCESS_TOKEN) return true
+    this.userTokens ??= this.storage.loadTokens()
+    return this.hasUsableUserToken(this.userTokens)
   }
 
   async getStatus(): Promise<AuthStatus> {
-    const userTokens = this.userTokens ?? this.loadStoredTokens()
+    this.userTokens ??= this.storage.loadTokens()
     return {
       appConfigured: Boolean(this.appId && this.appSecret),
-      userAuthenticated: Boolean(process.env.FEISHU_USER_ACCESS_TOKEN || userTokens?.accessToken),
-      userTokenExpiresAt: userTokens ? new Date(userTokens.accessTokenExpiresAt).toISOString() : undefined,
-      refreshTokenExpiresAt: userTokens?.refreshTokenExpiresAt
-        ? new Date(userTokens.refreshTokenExpiresAt).toISOString()
+      userAuthenticated: Boolean(process.env.FEISHU_USER_ACCESS_TOKEN) || this.hasUsableUserToken(this.userTokens),
+      userTokenExpiresAt: this.userTokens ? new Date(this.userTokens.accessTokenExpiresAt).toISOString() : undefined,
+      refreshTokenExpiresAt: this.userTokens?.refreshTokenExpiresAt
+        ? new Date(this.userTokens.refreshTokenExpiresAt).toISOString()
         : undefined,
-      scope: userTokens?.scope,
+      scope: this.userTokens?.scope,
       tenantTokenAvailable: Boolean(this.appId && this.appSecret),
       redirectUri: this.redirectUri,
       requiredScopes: this.scopes,
@@ -129,19 +100,39 @@ export class AuthManager {
     const envUserToken = process.env.FEISHU_USER_ACCESS_TOKEN
     if (envUserToken) return { token: envUserToken, identity: 'user' }
 
-    this.userTokens ??= this.loadStoredTokens()
-    if (this.userTokens) {
-      if (this.userTokens.accessTokenExpiresAt > Date.now() + 60_000) {
-        return { token: this.userTokens.accessToken, identity: 'user' }
-      }
-      if (this.userTokens.refreshToken) {
-        this.userTokens = await this.refreshUserToken(this.userTokens.refreshToken)
-        this.storeTokens(this.userTokens)
-        return { token: this.userTokens.accessToken, identity: 'user' }
-      }
+    this.userTokens ??= this.storage.loadTokens()
+    if (this.userTokens?.accessTokenExpiresAt && this.userTokens.accessTokenExpiresAt > Date.now() + 60_000) {
+      return { token: this.userTokens.accessToken, identity: 'user' }
+    }
+
+    const refreshToken = this.getUsableRefreshToken(this.userTokens)
+    if (refreshToken) {
+      this.userTokenRefresh ??= this.refreshUserToken(refreshToken)
+        .then((tokens) => {
+          this.userTokens = tokens
+          this.storage.storeTokens(tokens)
+          return tokens
+        })
+        .finally(() => {
+          this.userTokenRefresh = undefined
+        })
+      const tokens = await this.userTokenRefresh
+      return { token: tokens.accessToken, identity: 'user' }
     }
 
     return { token: await this.getTenantAccessToken(), identity: 'tenant' }
+  }
+
+  private hasUsableUserToken(tokens: UserTokenBundle | undefined): boolean {
+    if (!tokens?.accessToken) return false
+    if (tokens.accessTokenExpiresAt > Date.now() + 60_000) return true
+    return Boolean(this.getUsableRefreshToken(tokens))
+  }
+
+  private getUsableRefreshToken(tokens: UserTokenBundle | undefined): string | undefined {
+    if (!tokens?.refreshToken) return undefined
+    if (tokens.refreshTokenExpiresAt && tokens.refreshTokenExpiresAt <= Date.now() + 60_000) return undefined
+    return tokens.refreshToken
   }
 
   async startAuthorization(): Promise<{ authorizationUrl: string; redirectUri: string; scopes: string[]; droppedScopes?: string[] }> {
@@ -177,7 +168,7 @@ export class AuthManager {
       state,
       authorizationUrl: authorizationUrl.toString(),
     }
-    this.persistPendingAuthorization()
+    this.storage.storePendingAuthorization(this.pendingAuthorization)
     await this.startCallbackServer(redirect)
 
     const result: { authorizationUrl: string; redirectUri: string; scopes: string[]; droppedScopes?: string[] } = {
@@ -205,7 +196,10 @@ export class AuthManager {
       const tenantToken = await this.getTenantAccessToken()
       const response = await fetch(
         `${this.apiBaseUrl}/open-apis/application/v6/applications/${encodeURIComponent(this.appId)}/available_scopes`,
-        { headers: { Authorization: `Bearer ${tenantToken}` } },
+        {
+          headers: { Authorization: `Bearer ${tenantToken}` },
+          signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+        },
       )
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const payload = (await response.json()) as { code?: number; data?: { available_scopes?: Array<{ scope?: string }> } }
@@ -232,6 +226,7 @@ export class AuthManager {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
+      signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
     })
     const payload = (await response.json()) as TenantTokenResponse
     if (!response.ok || payload.code !== 0 || !payload.tenant_access_token) {
@@ -249,15 +244,12 @@ export class AuthManager {
     if (this.oauthServer?.listening) return
 
     const redirect = new URL(this.redirectUri)
-    const port = Number(redirect.port || (redirect.protocol === 'https:' ? 443 : 80))
 
-    // Check if another process already owns the callback port
+    // Check whether another instance of this MCP already owns the callback port
     try {
-      const probe = await fetch(this.redirectUri.replace('/callback', '/__health__'), { method: 'GET', signal: AbortSignal.timeout(2000) })
-      if (probe.ok || probe.status === 404) {
-        // Another process is serving this port — it will handle the callback
-        return
-      }
+      const healthUrl = new URL('/__health__', redirect)
+      const probe = await fetch(healthUrl, { method: 'GET', signal: AbortSignal.timeout(2000) })
+      if (probe.ok && await probe.text() === CALLBACK_HEALTH_RESPONSE) return
     } catch {
       // Port is free, start our own callback server
     }
@@ -275,7 +267,7 @@ export class AuthManager {
       try {
         const requestUrl = new URL(request.url ?? '/', this.redirectUri)
         if (requestUrl.pathname === '/__health__') {
-          response.writeHead(200).end('ok')
+          response.writeHead(200).end(CALLBACK_HEALTH_RESPONSE)
           return
         }
         if (requestUrl.pathname !== callbackPath) {
@@ -297,7 +289,7 @@ export class AuthManager {
 
         const tokens = await this.exchangeAuthorizationCode(code)
         this.userTokens = tokens
-        this.storeTokens(tokens)
+        this.storage.storeTokens(tokens)
         this.clearPendingAuthorization()
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
         response.end('<!doctype html><meta charset="utf-8"><title>Feishu authorized</title><h1>Authorization complete</h1><p>You can close this window and return to Qoder.</p>')
@@ -346,6 +338,7 @@ export class AuthManager {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body,
+      signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
     })
     const payload = (await response.json()) as OAuthTokenResponse
     if (!response.ok || payload.code !== 0 || !payload.access_token || !payload.expires_in) {
@@ -363,97 +356,17 @@ export class AuthManager {
     }
   }
 
-  private loadStoredTokens(): UserTokenBundle | undefined {
-    try {
-      if (process.platform === 'darwin') {
-        const value = execFileSync('security', [
-          'find-generic-password',
-          '-a',
-          this.appId,
-          '-s',
-          this.keychainService,
-          '-w',
-        ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
-        return value ? JSON.parse(value) as UserTokenBundle : undefined
-      }
-
-      return JSON.parse(readFileSync(this.fallbackStorePath, 'utf8')) as UserTokenBundle
-    } catch {
-      return undefined
-    }
-  }
-
-  private storeTokens(tokens: UserTokenBundle): void {
-    const value = JSON.stringify(tokens)
-    if (process.platform === 'darwin') {
-      execFileSync('security', [
-        'add-generic-password',
-        '-U',
-        '-a',
-        this.appId,
-        '-s',
-        this.keychainService,
-        '-w',
-        value,
-      ], { stdio: ['ignore', 'ignore', 'ignore'] })
-      return
-    }
-
-    mkdirSync(dirname(this.fallbackStorePath), { recursive: true, mode: 0o700 })
-    writeFileSync(this.fallbackStorePath, value, { mode: 0o600 })
-    chmodSync(this.fallbackStorePath, 0o600)
-  }
-
   clearStoredTokens(): void {
     this.userTokens = undefined
+    this.userTokenRefresh = undefined
     this.tenantToken = undefined
-    if (process.platform === 'darwin') {
-      try {
-        execFileSync('security', [
-          'delete-generic-password',
-          '-a',
-          this.appId,
-          '-s',
-          this.keychainService,
-        ], { stdio: ['ignore', 'ignore', 'ignore'] })
-      } catch {
-        // Token may not exist — ignore
-      }
-      return
-    }
-
-    try {
-      if (existsSync(this.fallbackStorePath)) unlinkSync(this.fallbackStorePath)
-    } catch {
-      // Ignore
-    }
-  }
-
-  private persistPendingAuthorization(): void {
-    if (!this.pendingAuthorization) return
-    try {
-      mkdirSync(dirname(this.pendingAuthPath), { recursive: true, mode: 0o700 })
-      writeFileSync(this.pendingAuthPath, JSON.stringify(this.pendingAuthorization), { mode: 0o600 })
-    } catch {
-      // Non-critical: authorization can still work if the callback server stays alive
-    }
-  }
-
-  private loadPendingAuthorization(): PendingAuthorization | undefined {
-    try {
-      if (!existsSync(this.pendingAuthPath)) return undefined
-      return JSON.parse(readFileSync(this.pendingAuthPath, 'utf8')) as PendingAuthorization
-    } catch {
-      return undefined
-    }
+    this.clearPendingAuthorization()
+    this.stopCallbackServer()
+    this.storage.clearTokens()
   }
 
   private clearPendingAuthorization(): void {
     this.pendingAuthorization = undefined
-    try {
-      if (existsSync(this.pendingAuthPath)) unlinkSync(this.pendingAuthPath)
-    } catch {
-      // Non-critical
-    }
+    this.storage.clearPendingAuthorization()
   }
 }

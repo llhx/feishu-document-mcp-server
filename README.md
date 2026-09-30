@@ -187,7 +187,7 @@
 
 #### `feishu_get_document_image`
 
-使用 `feishu_read_document` 返回的图片清单中的媒体 Token，获取单张文档图片。
+使用 `feishu_read_document` 返回的图片清单中的媒体 Token，获取单张文档图片，单张图片上限为 10 MB。
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
@@ -231,7 +231,7 @@
 - 电子表格每个工作表默认最多渲染 500 行 × 26 列，最多渲染 10 个工作表；多维表格每个数据表默认最多 200 条记录，最多渲染 10 个数据表；均通过 `maxRows` / `maxRecords` 调大
 - Docx 内嵌的电子表格、多维表格、文件、画板等区块仅展示元数据，不获取完整内容（如需完整内容请单独读取对应文档）
 - `feishu_read_document` 默认最多包含 20 张图片，单次最多可配置为 50 张
-- 大于 10 MB 的图片不包含在文档综合响应中，可通过 `feishu_get_document_image` 单独请求
+- 所有图片读取（包括 `feishu_read_document` 和 `feishu_get_document_image`）的单张图片上限均为 10 MB，超过上限无法通过 MCP 响应返回
 - `feishu_get_file` 返回的文本内容截断至 1 MB，base64 与图片上限 10 MB
 - 长文档开启 `includeRawBlocks` 后，可能产生非常大的响应
 - 思维笔记读取依赖思维笔记开放接口，需要在应用后台确认对应权限可用

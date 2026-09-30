@@ -1,4 +1,37 @@
-import type { AuthManager } from './auth.js'
+import type { AuthManager } from '../auth/auth.js'
+import {
+  extractBlockText,
+  extractImages,
+  normalizeBitableValue,
+  renderBlocks,
+  renderMarkdownTable,
+  renderMindnoteOutline,
+  stringifySheetCell,
+  type MindNode,
+} from './content-format.js'
+import { parseDocumentReference } from './document-reference.js'
+import type {
+  DocumentBlock,
+  DocumentContents,
+  DownloadedMedia,
+  ReadOptions,
+  ResolvedDocument,
+  SourceType,
+} from './feishu-types.js'
+import { API_REQUEST_TIMEOUT_MS } from '../shared/limits.js'
+import { detectMimeType, readMediaBody } from './media.js'
+
+export type {
+  DocumentBlock,
+  DocumentContents,
+  DocumentImage,
+  DownloadedMedia,
+  FileMeta,
+  ReadOptions,
+  ResolvedDocument,
+  ResolvedSourceType,
+  SourceType,
+} from './feishu-types.js'
 
 interface FeishuEnvelope<T> {
   code: number
@@ -20,98 +53,6 @@ interface BlockListData {
   items?: DocumentBlock[]
   has_more?: boolean
   page_token?: string
-}
-
-export interface DocumentBlock {
-  block_id: string
-  block_type: number
-  parent_id?: string
-  children?: string[]
-  [key: string]: unknown
-}
-
-export interface DocumentImage {
-  blockId: string
-  token: string
-  width?: number
-  height?: number
-}
-
-export type SourceType = 'auto' | 'wiki' | 'docx' | 'doc' | 'sheet' | 'bitable' | 'mindnote' | 'file'
-
-export type ResolvedSourceType = Exclude<SourceType, 'auto' | 'wiki'>
-
-export interface ResolvedDocument {
-  documentId: string
-  documentType: string
-  title?: string
-  sourceToken: string
-  sourceType: ResolvedSourceType | 'wiki'
-}
-
-export interface DocumentContents {
-  document: ResolvedDocument
-  blocks: DocumentBlock[]
-  text: string
-  images: DocumentImage[]
-  file?: FileMeta
-}
-
-export interface FileMeta {
-  token: string
-  name?: string
-}
-
-export interface ReadOptions {
-  maxRows?: number
-  maxRecords?: number
-}
-
-export interface DownloadedMedia {
-  data: Buffer
-  mimeType: string
-}
-
-const BLOCK_TYPE_NAMES: Record<number, string> = {
-  1: 'page',
-  2: 'text',
-  3: 'heading1',
-  4: 'heading2',
-  5: 'heading3',
-  6: 'heading4',
-  7: 'heading5',
-  8: 'heading6',
-  9: 'heading7',
-  10: 'heading8',
-  11: 'heading9',
-  12: 'bullet',
-  13: 'ordered',
-  14: 'code',
-  15: 'quote',
-  17: 'todo',
-  18: 'bitable',
-  19: 'callout',
-  20: 'chat-card',
-  21: 'diagram',
-  22: 'divider',
-  23: 'file',
-  24: 'grid',
-  25: 'grid-column',
-  26: 'iframe',
-  27: 'image',
-  28: 'isv',
-  29: 'mindnote',
-  30: 'sheet',
-  31: 'table',
-  32: 'table-cell',
-  33: 'view',
-  34: 'quote-container',
-  35: 'task',
-  36: 'okr',
-  37: 'add-ons',
-  38: 'jira',
-  39: 'wiki-catalog',
-  40: 'board',
 }
 
 interface LegacyDocContentData {
@@ -152,15 +93,6 @@ interface BitableRecordsData {
   page_token?: string
 }
 
-interface MindNode {
-  id?: string
-  children?: string[]
-  topic?: unknown
-  note?: unknown
-  text?: unknown
-  title?: unknown
-}
-
 interface MindNodesData {
   nodes?: MindNode[]
 }
@@ -190,11 +122,11 @@ export class FeishuClient {
 
   private async readDocxDocument(document: ResolvedDocument): Promise<DocumentContents> {
     const blocks = await this.listAllBlocks(document.documentId)
-    const images = this.extractImages(blocks)
-    const text = this.renderBlocks(blocks)
+    const images = extractImages(blocks)
+    const text = renderBlocks(blocks)
 
     if (!document.title) {
-      document.title = this.extractBlockText(blocks[0]) || undefined
+      document.title = extractBlockText(blocks[0]) || undefined
     }
 
     return { document, blocks, text, images }
@@ -313,29 +245,7 @@ export class FeishuClient {
       `/open-apis/mind/v1/minds/${encodeURIComponent(document.documentId)}/nodes`,
     )
     const nodes = (data.nodes ?? []).filter((node): node is MindNode & { id: string } => typeof node.id === 'string')
-    const nodeById = new Map(nodes.map((node) => [node.id, node]))
-    const childIds = new Set(nodes.flatMap((node) => node.children ?? []))
-    const lines: string[] = []
-    const visited = new Set<string>()
-
-    const renderNode = (node: MindNode & { id: string }, depth: number): void => {
-      if (visited.has(node.id) || depth > 50) return
-      visited.add(node.id)
-      lines.push(`${'  '.repeat(depth)}- ${mindNodeText(node) || '(untitled)'}`)
-      for (const childId of node.children ?? []) {
-        const child = nodeById.get(childId)
-        if (child) renderNode(child, depth + 1)
-      }
-    }
-
-    for (const node of nodes) {
-      if (!childIds.has(node.id)) renderNode(node, 0)
-    }
-    if (!lines.length) {
-      for (const node of nodes) lines.push(`- ${mindNodeText(node) || '(untitled)'}`)
-    }
-
-    return { document, blocks: [], text: lines.join('\n') || '(The mindnote is empty)', images: [] }
+    return { document, blocks: [], text: renderMindnoteOutline(nodes) || '(The mindnote is empty)', images: [] }
   }
 
   private async readFileDocument(document: ResolvedDocument): Promise<DocumentContents> {
@@ -355,7 +265,10 @@ export class FeishuClient {
     const { token: accessToken } = await this.auth.getAccessToken()
     const response = await fetch(
       `${this.auth.getApiBaseUrl()}/open-apis/drive/v1/medias/${encodeURIComponent(token)}/download`,
-      { headers: { Authorization: `Bearer ${accessToken}` } },
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT_MS),
+      },
     )
 
     if (!response.ok) {
@@ -363,7 +276,7 @@ export class FeishuClient {
       throw new Error(this.formatApiError('download document media', response.status, message))
     }
 
-    const data = Buffer.from(await response.arrayBuffer())
+    const data = await readMediaBody(response)
     return {
       data,
       mimeType: response.headers.get('content-type')?.split(';')[0] || detectMimeType(data),
@@ -422,6 +335,7 @@ export class FeishuClient {
     const { token, identity } = await this.auth.getAccessToken()
     const response = await fetch(`${this.auth.getApiBaseUrl()}${path}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
     })
     const raw = await response.text()
     let payload: FeishuEnvelope<T>
@@ -445,114 +359,9 @@ export class FeishuClient {
     return `Unable to ${action} (HTTP ${status}): ${safeDetail}`
   }
 
-  private extractImages(blocks: DocumentBlock[]): DocumentImage[] {
-    const images: DocumentImage[] = []
-    for (const block of blocks) {
-      const image = block.image
-      if (!isRecord(image) || typeof image.token !== 'string') continue
-      images.push({
-        blockId: block.block_id,
-        token: image.token,
-        width: typeof image.width === 'number' ? image.width : undefined,
-        height: typeof image.height === 'number' ? image.height : undefined,
-      })
-    }
-    return images
-  }
-
-  private renderBlocks(blocks: DocumentBlock[]): string {
-    const lines: string[] = []
-    for (const block of blocks) {
-      const type = BLOCK_TYPE_NAMES[block.block_type] ?? `block-${block.block_type}`
-      const text = this.extractBlockText(block)
-      if (text) {
-        lines.push(`[${type}] ${text}`)
-      } else if (['image', 'file', 'sheet', 'bitable', 'mindnote', 'board', 'iframe'].includes(type)) {
-        lines.push(`[${type}] ${summarizeEmbeddedBlock(block, type)}`)
-      }
-    }
-    return lines.join('\n')
-  }
-
-  private extractBlockText(block: DocumentBlock | undefined): string {
-    if (!block) return ''
-    const values: string[] = []
-    for (const value of Object.values(block)) {
-      if (isRecord(value) && Array.isArray(value.elements)) {
-        values.push(...value.elements.map(renderTextElement).filter(Boolean))
-      }
-    }
-    return values.join('').trim()
-  }
 }
 
-const URL_PATH_TYPES: Record<string, ResolvedSourceType> = {
-  docx: 'docx',
-  doc: 'doc',
-  sheets: 'sheet',
-  base: 'bitable',
-  file: 'file',
-  mindnotes: 'mindnote',
-}
-
-function parseDocumentReference(
-  source: string,
-  sourceType: SourceType,
-): { type: ResolvedSourceType | 'wiki'; token: string } {
-  const trimmed = source.trim()
-  try {
-    const url = new URL(trimmed)
-    const segments = url.pathname.split('/').filter(Boolean)
-    const wikiIndex = segments.indexOf('wiki')
-    if (wikiIndex >= 0 && segments[wikiIndex + 1]) return { type: 'wiki', token: segments[wikiIndex + 1] }
-    for (const [segment, resolvedType] of Object.entries(URL_PATH_TYPES)) {
-      const index = segments.indexOf(segment)
-      if (index >= 0 && segments[index + 1]) return { type: resolvedType, token: segments[index + 1] }
-    }
-    throw new Error('URL must contain /wiki/<token>, /docx/<token>, /doc/<token>, /sheets/<token>, /base/<token>, /file/<token>, or /mindnotes/<token>')
-  } catch (error) {
-    if (trimmed.includes('://')) throw error
-  }
-
-  if (!trimmed) throw new Error('Document URL or token is required')
-  if (sourceType === 'auto') {
-    if (/^wik/i.test(trimmed)) return { type: 'wiki', token: trimmed }
-    return { type: 'docx', token: trimmed }
-  }
-  if (sourceType === 'wiki') return { type: 'wiki', token: trimmed }
-  return { type: sourceType, token: trimmed }
-}
-
-function renderTextElement(value: unknown): string {
-  if (!isRecord(value)) return ''
-  if (isRecord(value.text_run) && typeof value.text_run.content === 'string') return value.text_run.content
-  if (isRecord(value.equation) && typeof value.equation.content === 'string') return value.equation.content
-  if (isRecord(value.mention_doc)) {
-    const title = typeof value.mention_doc.title === 'string' ? value.mention_doc.title : 'document'
-    const url = typeof value.mention_doc.url === 'string' ? decodeURIComponent(value.mention_doc.url) : ''
-    return url ? `[${title}](${url})` : title
-  }
-  if (isRecord(value.mention_user)) {
-    return typeof value.mention_user.user_id === 'string' ? `@${value.mention_user.user_id}` : '@user'
-  }
-  if (isRecord(value.reminder)) {
-    return typeof value.reminder.text === 'string' ? value.reminder.text : '[reminder]'
-  }
-  if (isRecord(value.file)) {
-    return typeof value.file.file_token === 'string' ? `[file:${value.file.file_token}]` : '[file]'
-  }
-  return ''
-}
-
-function summarizeEmbeddedBlock(block: DocumentBlock, type: string): string {
-  const value = block[type.replace('-', '_')]
-  if (!isRecord(value)) return `block_id=${block.block_id}`
-  const safeEntries = Object.entries(value)
-    .filter(([key, entry]) => ['token', 'file_token', 'name', 'url', 'width', 'height'].includes(key) && ['string', 'number'].includes(typeof entry))
-  const summary = Object.fromEntries(safeEntries)
-  return `${JSON.stringify(summary)} block_id=${block.block_id}`
-}
-
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000
 const DEFAULT_SHEET_MAX_ROWS = 500
 const MAX_SHEET_ROWS = 5000
 const MAX_SHEET_COLUMNS = 26
@@ -560,8 +369,6 @@ const MAX_SHEETS_PER_SPREADSHEET = 10
 const DEFAULT_BITABLE_MAX_RECORDS = 200
 const MAX_BITABLE_RECORDS = 1000
 const MAX_BITABLE_TABLES = 10
-const BITABLE_DATE_FIELD_TYPES = new Set([5, 1001, 1002])
-const BITABLE_PERSON_FIELD_TYPES = new Set([11, 1003, 1004])
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
@@ -575,78 +382,4 @@ function columnLetter(index: number): string {
     index = Math.floor((index - 1) / 26)
   }
   return label
-}
-
-function stringifySheetCell(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  if (typeof value === 'string') return value
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
-  return JSON.stringify(value)
-}
-
-function sanitizeMarkdownCell(value: string): string {
-  return value.replace(/\r?\n/g, ' ').replace(/\|/g, '\\|').trim()
-}
-
-function renderMarkdownTable(rows: string[][]): string {
-  if (!rows.length) return '(empty)'
-  const width = Math.max(...rows.map((row) => row.length))
-  const normalized = rows.map((row) => {
-    const cells = [...row]
-    while (cells.length < width) cells.push('')
-    return cells
-  })
-  const header = normalized[0]
-  const lines = [
-    `| ${header.map(sanitizeMarkdownCell).join(' | ')} |`,
-    `| ${header.map(() => '---').join(' | ')} |`,
-    ...normalized.slice(1).map((row) => `| ${row.map(sanitizeMarkdownCell).join(' | ')} |`),
-  ]
-  return lines.join('\n')
-}
-
-function normalizeBitableValue(value: unknown, fieldType?: number): string {
-  if (value === null || value === undefined) return ''
-  if (typeof value === 'string') return value
-  if (typeof value === 'number') {
-    if (fieldType !== undefined && BITABLE_DATE_FIELD_TYPES.has(fieldType)) return new Date(value).toISOString()
-    return String(value)
-  }
-  if (typeof value === 'boolean') return value ? 'true' : 'false'
-  if (Array.isArray(value)) {
-    return value.map((item) => normalizeBitableValue(item, fieldType)).filter(Boolean).join(', ')
-  }
-  if (isRecord(value)) {
-    if (fieldType !== undefined && BITABLE_PERSON_FIELD_TYPES.has(fieldType) && typeof value.id === 'string') return value.id
-    if (typeof value.text === 'string' && value.text) return value.text
-    if (typeof value.name === 'string' && value.name) return value.name
-    if (typeof value.link === 'string' && value.link) return value.link
-    if (typeof value.id === 'string' && value.id) return value.id
-    return JSON.stringify(value)
-  }
-  return String(value)
-}
-
-function mindNodeText(node: MindNode): string {
-  if (typeof node.topic === 'string') return node.topic
-  if (isRecord(node.topic)) {
-    if (typeof node.topic.text === 'string') return node.topic.text
-    if (Array.isArray(node.topic.elements)) return node.topic.elements.map(renderTextElement).filter(Boolean).join('')
-  }
-  if (typeof node.note === 'string') return node.note
-  if (typeof node.text === 'string') return node.text
-  if (typeof node.title === 'string') return node.title
-  return ''
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function detectMimeType(data: Buffer): string {
-  if (data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png'
-  if (data.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg'
-  if (data.subarray(0, 6).toString('ascii') === 'GIF89a' || data.subarray(0, 6).toString('ascii') === 'GIF87a') return 'image/gif'
-  if (data.subarray(0, 4).toString('ascii') === 'RIFF' && data.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp'
-  return 'application/octet-stream'
 }

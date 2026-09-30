@@ -1,0 +1,2 @@
+export const API_REQUEST_TIMEOUT_MS = 30_000
+export const MAX_MEDIA_BYTES = 10 * 1024 * 1024

@@ -1,6 +1,6 @@
 {
   "name": "feishu-document-mcp-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Read-only MCP server for Feishu/Lark documents, Wiki pages, and embedded images",
   "type": "module",
   "main": "./dist/index.js",

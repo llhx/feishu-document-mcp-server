@@ -1,7 +1,7 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { createServer, type Server } from 'node:http'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -9,7 +9,20 @@ const DEFAULT_SCOPES = [
   'offline_access',
   'docx:document:readonly',
   'wiki:node:read',
+  'sheets:spreadsheet:readonly',
+  'bitable:app:readonly',
+  'drive:drive:readonly',
   'docs:document.media:download',
+]
+
+/** Fallback scopes used when the full list fails due to an unenabled scope in the app */
+const FALLBACK_SCOPES = [
+  'offline_access',
+  'docx:document:readonly',
+  'wiki:node:read',
+  'sheets:spreadsheet:readonly',
+  'bitable:app:readonly',
+  'drive:drive:readonly',
 ]
 
 interface UserTokenBundle {
@@ -40,7 +53,6 @@ interface TenantTokenResponse {
 
 interface PendingAuthorization {
   state: string
-  codeVerifier: string
   authorizationUrl: string
 }
 
@@ -64,6 +76,7 @@ export class AuthManager {
   private readonly scopes: string[]
   private readonly keychainService: string
   private readonly fallbackStorePath: string
+  private readonly pendingAuthPath: string
   private userTokens?: UserTokenBundle
   private tenantToken?: { value: string; expiresAt: number }
   private oauthServer?: Server
@@ -78,11 +91,22 @@ export class AuthManager {
     this.scopes = (process.env.FEISHU_READONLY_SCOPES?.split(/[ ,]+/) ?? DEFAULT_SCOPES).filter(Boolean)
     this.keychainService = `qoder-feishu-document-mcp:${this.appId || 'unconfigured'}`
     this.fallbackStorePath = join(homedir(), '.config', 'feishu-document-mcp', 'tokens.json')
+    this.pendingAuthPath = join(homedir(), '.config', 'feishu-document-mcp', 'pending-auth.json')
     this.userTokens = this.loadStoredTokens()
+    this.pendingAuthorization = this.loadPendingAuthorization()
   }
 
   getApiBaseUrl(): string {
     return this.apiBaseUrl
+  }
+
+  isUserAuthenticated(): boolean {
+    const envUserToken = process.env.FEISHU_USER_ACCESS_TOKEN
+    if (envUserToken) return true
+    const tokens = this.userTokens ?? this.loadStoredTokens()
+    if (!tokens?.accessToken) return false
+    if (tokens.accessTokenExpiresAt > Date.now() + 60_000) return true
+    return Boolean(tokens.refreshToken)
   }
 
   async getStatus(): Promise<AuthStatus> {
@@ -120,10 +144,12 @@ export class AuthManager {
     return { token: await this.getTenantAccessToken(), identity: 'tenant' }
   }
 
-  async startAuthorization(): Promise<{ authorizationUrl: string; redirectUri: string; scopes: string[] }> {
+  async startAuthorization(): Promise<{ authorizationUrl: string; redirectUri: string; scopes: string[]; droppedScopes?: string[] }> {
     this.assertConfigured()
 
-    if (this.pendingAuthorization && this.oauthServer?.listening) {
+    // Resume persisted authorization from a previous process
+    if (this.pendingAuthorization) {
+      await this.ensureCallbackServer()
       return {
         authorizationUrl: this.pendingAuthorization.authorizationUrl,
         redirectUri: this.redirectUri,
@@ -136,34 +162,63 @@ export class AuthManager {
       throw new Error('FEISHU_OAUTH_REDIRECT_URI must use localhost or 127.0.0.1 for this local MCP server')
     }
 
+    // Pre-validate scopes against the app's enabled permissions
+    const { scopes: activeScopes, droppedScopes } = await this.resolveActiveScopes()
+
     const state = randomBytes(24).toString('base64url')
-    const codeVerifier = randomBytes(48).toString('base64url')
-    const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url')
     const authorizationUrl = new URL('/open-apis/authen/v1/authorize', this.accountsBaseUrl)
     authorizationUrl.searchParams.set('client_id', this.appId)
     authorizationUrl.searchParams.set('redirect_uri', this.redirectUri)
-    authorizationUrl.searchParams.set('scope', this.scopes.join(' '))
+    authorizationUrl.searchParams.set('scope', activeScopes.join(' '))
     authorizationUrl.searchParams.set('state', state)
-    authorizationUrl.searchParams.set('code_challenge', codeChallenge)
-    authorizationUrl.searchParams.set('code_challenge_method', 'S256')
+    authorizationUrl.searchParams.set('response_type', 'code')
 
     this.pendingAuthorization = {
       state,
-      codeVerifier,
       authorizationUrl: authorizationUrl.toString(),
     }
+    this.persistPendingAuthorization()
     await this.startCallbackServer(redirect)
 
-    return {
+    const result: { authorizationUrl: string; redirectUri: string; scopes: string[]; droppedScopes?: string[] } = {
       authorizationUrl: authorizationUrl.toString(),
       redirectUri: this.redirectUri,
-      scopes: this.scopes,
+      scopes: activeScopes,
     }
+    if (droppedScopes.length) result.droppedScopes = droppedScopes
+    return result
   }
 
   private assertConfigured(): void {
     if (!this.appId || !this.appSecret) {
       throw new Error('Missing APP_ID/APP_SECRET (or FEISHU_APP_ID/FEISHU_APP_SECRET) in the MCP environment')
+    }
+  }
+
+  /**
+   * Check which of the requested scopes are actually enabled in the Feishu app.
+   * Returns the active scopes and any that were dropped because they are not enabled.
+   * Falls back to the full scope list if the check API is unavailable.
+   */
+  private async resolveActiveScopes(): Promise<{ scopes: string[]; droppedScopes: string[] }> {
+    try {
+      const tenantToken = await this.getTenantAccessToken()
+      const response = await fetch(
+        `${this.apiBaseUrl}/open-apis/application/v6/applications/${encodeURIComponent(this.appId)}/available_scopes`,
+        { headers: { Authorization: `Bearer ${tenantToken}` } },
+      )
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const payload = (await response.json()) as { code?: number; data?: { available_scopes?: Array<{ scope?: string }> } }
+      if (payload.code !== 0 || !payload.data?.available_scopes) {
+        return { scopes: this.scopes, droppedScopes: [] }
+      }
+      const enabledScopes = new Set(payload.data.available_scopes.map((s) => s.scope).filter(Boolean))
+      const activeScopes = this.scopes.filter((scope) => enabledScopes.has(scope))
+      const droppedScopes = this.scopes.filter((scope) => !enabledScopes.has(scope))
+      return { scopes: activeScopes.length ? activeScopes : this.scopes, droppedScopes }
+    } catch {
+      // API check failed — use the full scope list and let the authorization page handle validation
+      return { scopes: this.scopes, droppedScopes: [] }
     }
   }
 
@@ -190,6 +245,26 @@ export class AuthManager {
     return this.tenantToken.value
   }
 
+  private async ensureCallbackServer(): Promise<void> {
+    if (this.oauthServer?.listening) return
+
+    const redirect = new URL(this.redirectUri)
+    const port = Number(redirect.port || (redirect.protocol === 'https:' ? 443 : 80))
+
+    // Check if another process already owns the callback port
+    try {
+      const probe = await fetch(this.redirectUri.replace('/callback', '/__health__'), { method: 'GET', signal: AbortSignal.timeout(2000) })
+      if (probe.ok || probe.status === 404) {
+        // Another process is serving this port — it will handle the callback
+        return
+      }
+    } catch {
+      // Port is free, start our own callback server
+    }
+
+    await this.startCallbackServer(redirect)
+  }
+
   private async startCallbackServer(redirect: URL): Promise<void> {
     if (this.oauthServer?.listening) return
 
@@ -199,6 +274,10 @@ export class AuthManager {
     this.oauthServer = createServer(async (request, response) => {
       try {
         const requestUrl = new URL(request.url ?? '/', this.redirectUri)
+        if (requestUrl.pathname === '/__health__') {
+          response.writeHead(200).end('ok')
+          return
+        }
         if (requestUrl.pathname !== callbackPath) {
           response.writeHead(404).end('Not found')
           return
@@ -216,10 +295,10 @@ export class AuthManager {
           throw new Error('OAuth state mismatch')
         }
 
-        const tokens = await this.exchangeAuthorizationCode(code, this.pendingAuthorization.codeVerifier)
+        const tokens = await this.exchangeAuthorizationCode(code)
         this.userTokens = tokens
         this.storeTokens(tokens)
-        this.pendingAuthorization = undefined
+        this.clearPendingAuthorization()
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
         response.end('<!doctype html><meta charset="utf-8"><title>Feishu authorized</title><h1>Authorization complete</h1><p>You can close this window and return to Qoder.</p>')
         this.stopCallbackServer()
@@ -241,14 +320,13 @@ export class AuthManager {
     if (server?.listening) server.close()
   }
 
-  private async exchangeAuthorizationCode(code: string, codeVerifier: string): Promise<UserTokenBundle> {
+  private async exchangeAuthorizationCode(code: string): Promise<UserTokenBundle> {
     const body = new URLSearchParams({
       grant_type: 'authorization_code',
       client_id: this.appId,
       client_secret: this.appSecret,
       code,
       redirect_uri: this.redirectUri,
-      code_verifier: codeVerifier,
     })
     return this.requestUserTokens(body)
   }
@@ -324,5 +402,58 @@ export class AuthManager {
     mkdirSync(dirname(this.fallbackStorePath), { recursive: true, mode: 0o700 })
     writeFileSync(this.fallbackStorePath, value, { mode: 0o600 })
     chmodSync(this.fallbackStorePath, 0o600)
+  }
+
+  clearStoredTokens(): void {
+    this.userTokens = undefined
+    this.tenantToken = undefined
+    if (process.platform === 'darwin') {
+      try {
+        execFileSync('security', [
+          'delete-generic-password',
+          '-a',
+          this.appId,
+          '-s',
+          this.keychainService,
+        ], { stdio: ['ignore', 'ignore', 'ignore'] })
+      } catch {
+        // Token may not exist — ignore
+      }
+      return
+    }
+
+    try {
+      if (existsSync(this.fallbackStorePath)) unlinkSync(this.fallbackStorePath)
+    } catch {
+      // Ignore
+    }
+  }
+
+  private persistPendingAuthorization(): void {
+    if (!this.pendingAuthorization) return
+    try {
+      mkdirSync(dirname(this.pendingAuthPath), { recursive: true, mode: 0o700 })
+      writeFileSync(this.pendingAuthPath, JSON.stringify(this.pendingAuthorization), { mode: 0o600 })
+    } catch {
+      // Non-critical: authorization can still work if the callback server stays alive
+    }
+  }
+
+  private loadPendingAuthorization(): PendingAuthorization | undefined {
+    try {
+      if (!existsSync(this.pendingAuthPath)) return undefined
+      return JSON.parse(readFileSync(this.pendingAuthPath, 'utf8')) as PendingAuthorization
+    } catch {
+      return undefined
+    }
+  }
+
+  private clearPendingAuthorization(): void {
+    this.pendingAuthorization = undefined
+    try {
+      if (existsSync(this.pendingAuthPath)) unlinkSync(this.pendingAuthPath)
+    } catch {
+      // Non-critical
+    }
   }
 }

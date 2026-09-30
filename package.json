@@ -38,5 +38,10 @@
   },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/llhx/feishu-document-mcp-server.git"
+  },
+  "homepage": "https://github.com/llhx/feishu-document-mcp-server/blob/main/README.md"
 }

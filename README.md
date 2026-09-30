@@ -238,46 +238,8 @@ offline_access docx:document:readonly wiki:node:read docs:document.media:downloa
 
 确认应用已开通 `docs:document.media:download` 权限，且 `includeImages` 为 `true`。可以检查返回的图片清单，再通过 `feishu_get_document_image` 获取指定图片。
 
-## 本地开发
+## 版本更新
 
-```bash
-git clone <repository-url>
-cd feishu-document-mcp-server
-npm install
-npm run build
-npm start
-```
+本包通过 `prepack` 脚本自动编译 TypeScript 源码后再发布到 npm。
 
-在 MCP 客户端中使用本地构建产物：
-
-```json
-{
-  "mcpServers": {
-    "feishu-document-local": {
-      "command": "node",
-      "args": ["/absolute/path/to/feishu-document-mcp-server/dist/index.js"],
-      "env": {
-        "FEISHU_APP_ID": "your_app_id",
-        "FEISHU_APP_SECRET": "your_app_secret"
-      }
-    }
-  }
-}
-```
-
-修改 `src` 目录中的源码后，需要重新执行 `npm run build`。
-
-## 发布
-
-`prepack` 脚本会在 npm 创建发布包之前自动编译最新的 TypeScript 源码：
-
-```bash
-npm version patch
-npm publish
-```
-
-可根据变更范围将 `patch` 替换为 `minor` 或 `major`。发布前可以检查最终打包内容：
-
-```bash
-npm pack --dry-run
-```
+如需了解项目源码、本地开发或贡献代码，请访问 [GitHub 仓库](https://github.com/llhx/feishu-document-mcp-server)。
